@@ -223,44 +223,59 @@ namespace EasySwitch {
             return null;
         }
 
-        static bool ProbeBoltSlot(Hid dev, byte slot, out string name, out string identity, out byte fallbackFeat) {
+        static bool ProbeBoltSlot(Hid shortDev, Hid longDev, byte slot, out string name, out string identity, out byte fallbackFeat) {
             name = ""; identity = ""; fallbackFeat = 0;
-            byte[] reqInfo = new byte[20];
-            reqInfo[0] = 0x11; reqInfo[1] = 0xFF; reqInfo[2] = 0x83; reqInfo[3] = 0xB5; reqInfo[4] = (byte)(0x50 + slot);
-            if (!dev.Write(reqInfo)) {
-                byte[] reqShort = new byte[] { 0x10, 0xFF, 0x83, 0xB5, (byte)(0x50 + slot), 0x00, 0x00 };
-                if (!dev.Write(reqShort)) return true;
-            }
-            DateTime dl = DateTime.UtcNow.AddMilliseconds(150);
+            if (shortDev == null) return true;
+            byte[] reqInfo = new byte[] { 0x10, 0xFF, 0x83, 0xB5, (byte)(0x50 + slot), 0x00, 0x00 };
+            if (!shortDev.Write(reqInfo)) return true;
+            DateTime dl = DateTime.UtcNow.AddMilliseconds(180);
             int paired = -1;
             while (DateTime.UtcNow < dl) {
-                byte[] r = dev.Read(40);
-                if (r == null || r.Length < 7) continue;
-                if (r[1] == 0xFF && r[2] == 0x8F && r[3] == 0x83 && r[4] == 0xB5) {
-                    paired = (r[5] == 0x08 || r[5] == 0x09) ? 0 : 1;
-                    break;
+                byte[] rShort = shortDev.Read(30);
+                if (rShort != null && rShort.Length >= 7) {
+                    if (rShort[1] == 0xFF && rShort[2] == 0x8F && rShort[3] == 0x83 && rShort[4] == 0xB5) {
+                        paired = (rShort[5] == 0x08 || rShort[5] == 0x09) ? 0 : 1;
+                        break;
+                    }
+                    if (rShort[1] == 0xFF && rShort[2] == 0x83 && rShort[3] == 0xB5 && rShort[4] == (byte)(0x50 + slot)) {
+                        paired = 1;
+                        if (rShort.Length >= 10)
+                            identity = string.Format("unit:{0:x2}{1:x2}{2:x2}{3:x2}", rShort[6], rShort[7], rShort[8], rShort[9]);
+                        break;
+                    }
                 }
-                if (r[1] == 0xFF && r[2] == 0x83 && r[3] == 0xB5 && r[4] == (byte)(0x50 + slot)) {
-                    paired = 1;
-                    if (r.Length >= 10)
-                        identity = string.Format("unit:{0:x2}{1:x2}{2:x2}{3:x2}", r[6], r[7], r[8], r[9]);
-                    break;
+                if (longDev != null) {
+                    byte[] rLong = longDev.Read(30);
+                    if (rLong != null && rLong.Length >= 10 && rLong[1] == 0xFF && rLong[2] == 0x83 && rLong[3] == 0xB5 && rLong[4] == (byte)(0x50 + slot)) {
+                        paired = 1;
+                        identity = string.Format("unit:{0:x2}{1:x2}{2:x2}{3:x2}", rLong[6], rLong[7], rLong[8], rLong[9]);
+                        break;
+                    }
                 }
             }
-            if (paired <= 0) return false;
+            if (paired == 0) return false;
+            if (paired < 0) return true;
 
-            byte[] reqName = new byte[20];
-            reqName[0] = 0x11; reqName[1] = 0xFF; reqName[2] = 0x83; reqName[3] = 0xB5; reqName[4] = (byte)(0x60 + slot); reqName[5] = 0x01;
-            if (dev.Write(reqName) || dev.Write(new byte[] { 0x10, 0xFF, 0x83, 0xB5, (byte)(0x60 + slot), 0x01, 0x00 })) {
-                dl = DateTime.UtcNow.AddMilliseconds(150);
+            byte[] reqName = new byte[] { 0x10, 0xFF, 0x83, 0xB5, (byte)(0x60 + slot), 0x01, 0x00 };
+            if (shortDev.Write(reqName)) {
+                dl = DateTime.UtcNow.AddMilliseconds(180);
                 while (DateTime.UtcNow < dl) {
-                    byte[] r = dev.Read(40);
-                    if (r == null || r.Length < 8) continue;
-                    if (r[1] == 0xFF && r[2] == 0x8F && r[3] == 0x83 && r[4] == 0xB5) break;
-                    if (r[1] == 0xFF && r[2] == 0x83 && r[3] == 0xB5 && r[4] == (byte)(0x60 + slot)) {
-                        int nlen = Math.Min((int)r[6], r.Length - 7);
-                        if (nlen > 0) name = Encoding.UTF8.GetString(r, 7, nlen).TrimEnd('\0');
-                        break;
+                    if (longDev != null) {
+                        byte[] rLong = longDev.Read(30);
+                        if (rLong != null && rLong.Length >= 8 && rLong[1] == 0xFF && rLong[2] == 0x83 && rLong[3] == 0xB5 && rLong[4] == (byte)(0x60 + slot)) {
+                            int nlen = Math.Min((int)rLong[6], rLong.Length - 7);
+                            if (nlen > 0) name = Encoding.UTF8.GetString(rLong, 7, nlen).TrimEnd('\0');
+                            break;
+                        }
+                    }
+                    byte[] rShort = shortDev.Read(30);
+                    if (rShort != null && rShort.Length >= 7) {
+                        if (rShort[1] == 0xFF && rShort[2] == 0x8F && rShort[3] == 0x83 && rShort[4] == 0xB5) break;
+                        if (rShort.Length >= 8 && rShort[1] == 0xFF && rShort[2] == 0x83 && rShort[3] == 0xB5 && rShort[4] == (byte)(0x60 + slot)) {
+                            int nlen = Math.Min((int)rShort[6], rShort.Length - 7);
+                            if (nlen > 0) name = Encoding.UTF8.GetString(rShort, 7, nlen).TrimEnd('\0');
+                            break;
+                        }
                     }
                 }
             }
@@ -367,29 +382,56 @@ namespace EasySwitch {
             var opened = new List<Hid>();
             try {
                 var targets = LoadCachedTargets(opened);
-                if (targets.Count == 0) {
+                if (targets.Count < 2) {
+                    foreach (var d in opened) d.Close();
+                    opened.Clear();
+                    targets.Clear();
                     var ifaces = Hid.Enumerate(LOGITECH_VID);
+                    var shortDevs = new Dictionary<string, Hid>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var sIface in ifaces) {
+                        if (sIface.OutLen == 7) {
+                            try {
+                                string baseKey = System.Text.RegularExpressions.Regex.Replace(sIface.Path.ToLowerInvariant(), @"&col[0-9a-f]{2}", "");
+                                var sDev = new Hid(sIface);
+                                opened.Add(sDev);
+                                shortDevs[baseKey] = sDev;
+                            } catch { }
+                        }
+                    }
+
                     foreach (var iface in ifaces) {
                         if (iface.OutLen != 20) continue; // Only probe the 20-byte HID++ 2.0 long report collection (0x11)
                         Hid dev;
                         try { dev = new Hid(iface); } catch { continue; }
                         opened.Add(dev);
 
+                        string baseKey = System.Text.RegularExpressions.Regex.Replace(iface.Path.ToLowerInvariant(), @"&col[0-9a-f]{2}", "");
+                        Hid shortDev = null;
+                        shortDevs.TryGetValue(baseKey, out shortDev);
+
                         byte[] indices = new byte[] { 1, 2, 3, 4, 5, 6, 0xFF };
                         foreach (byte didx in indices) {
                             if (didx == 0xFF && (iface.Product ?? "").IndexOf("Receiver", StringComparison.OrdinalIgnoreCase) >= 0)
                                 continue;
-                            byte[] r = HidppCall(dev, 0x11, didx, 0x00, 0, new byte[] { 0x18, 0x14, 0x00 }, 220);
-                            if (r == null || r[4] == 0) continue;
-                            byte featIdx = r[4];
+                            string sName = "", sId = "";
+                            byte fbFeat = 0;
+                            if (didx != 0xFF) {
+                                if (!ProbeBoltSlot(shortDev, dev, didx, out sName, out sId, out fbFeat)) continue;
+                            }
+                            byte featIdx = fbFeat;
+                            if (featIdx == 0) {
+                                byte[] r = HidppCall(dev, 0x11, didx, 0x00, 0, new byte[] { 0x18, 0x14, 0x00 }, 850);
+                                if (r != null) featIdx = r[4];
+                            }
+                            if (featIdx == 0) continue;
 
-                            string devName = !string.IsNullOrEmpty(iface.Product) ? iface.Product : ("Slot " + didx);
-                            string devId = iface.Path.ToLowerInvariant() + ":" + didx;
+                            string devName = !string.IsNullOrEmpty(sName) ? sName : (!string.IsNullOrEmpty(iface.Product) ? iface.Product : ("Slot " + didx));
+                            string devId = !string.IsNullOrEmpty(sId) ? sId : (iface.Path.ToLowerInvariant() + ":" + didx);
 
                             var td = new TargetDevice {
                                 Dev = dev, IfacePath = iface.Path, InLen = iface.InLen, OutLen = iface.OutLen,
                                 ReportId = 0x11, DevIdx = didx, FeatureIdx = featIdx,
-                                Name = devName, Identity = devId, Rank = (didx == 1 ? 20 : 0)
+                                Name = devName, Identity = devId, Rank = DeviceRank(devName)
                             };
 
                             int existing = targets.FindIndex(t => t.Identity == devId);

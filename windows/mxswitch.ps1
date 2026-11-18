@@ -360,35 +360,44 @@ function Resolve-MxFeature {
 }
 
 function Get-BoltSlotInfo {
-    param($Dev, [int]$Slot)
+    param($Dev, [int]$Slot, $ShortDev = $null)
     if ($env:MXSWITCH_TEST -or $Slot -eq 255) {
         return [pscustomobject]@{ Paired = $true; Name = ''; Identity = ''; FallbackFeat = 0 }
     }
-    # On Windows, sending a 0x10 short report to the 20-byte long collection (0x11)
-    # causes hidclass.sys to drop the report and time out on every Read().
-    if ($Dev.OutLen -eq 20) {
+    $ioDev = if ($ShortDev) { $ShortDev } elseif ($Dev.OutLen -eq 7) { $Dev } else { $null }
+    $longDev = if ($Dev.OutLen -eq 20) { $Dev } else { $null }
+    if (-not $ioDev) {
         return [pscustomobject]@{ Paired = $true; Name = ''; Identity = ''; FallbackFeat = 0 }
     }
     $reqInfo = [byte[]]@(0x10, 0xFF, 0x83, 0xB5, (0x50 + $Slot), 0x00, 0x00)
-    if (-not $Dev.Write($reqInfo)) {
+    if (-not $ioDev.Write($reqInfo)) {
         return [pscustomobject]@{ Paired = $true; Name = ''; Identity = ''; FallbackFeat = 0 }
     }
-    $deadline = (Get-Date).AddMilliseconds(350)
+    $deadline = (Get-Date).AddMilliseconds(220)
     $paired = -1
     $identity = ''
     while ((Get-Date) -lt $deadline) {
-        $r = $Dev.Read(60)
-        if (-not $r -or $r.Length -lt 7) { continue }
-        if ($r[1] -eq 0xFF -and $r[2] -eq 0x8F -and $r[3] -eq 0x83 -and $r[4] -eq 0xB5) {
-            $paired = if ($r[5] -in @(0x08, 0x09)) { 0 } else { 1 }
-            break
-        }
-        if ($r[1] -eq 0xFF -and $r[2] -eq 0x83 -and $r[3] -eq 0xB5 -and $r[4] -eq (0x50 + $Slot)) {
-            $paired = 1
-            if ($r.Length -ge 10) {
-                $identity = 'unit:' + (Format-MxHex ([byte[]]$r[6..9]))
+        $r = $ioDev.Read(35)
+        if ($r -and $r.Length -ge 7) {
+            if ($r[1] -eq 0xFF -and $r[2] -eq 0x8F -and $r[3] -eq 0x83 -and $r[4] -eq 0xB5) {
+                $paired = if ($r[5] -in @(0x08, 0x09)) { 0 } else { 1 }
+                break
             }
-            break
+            if ($r[1] -eq 0xFF -and $r[2] -eq 0x83 -and $r[3] -eq 0xB5 -and $r[4] -eq (0x50 + $Slot)) {
+                $paired = 1
+                if ($r.Length -ge 10) {
+                    $identity = 'unit:' + (Format-MxHex ([byte[]]$r[6..9]))
+                }
+                break
+            }
+        }
+        if ($longDev) {
+            $rl = $longDev.Read(35)
+            if ($rl -and $rl.Length -ge 10 -and $rl[1] -eq 0xFF -and $rl[2] -eq 0x83 -and $rl[3] -eq 0xB5 -and $rl[4] -eq (0x50 + $Slot)) {
+                $paired = 1
+                $identity = 'unit:' + (Format-MxHex ([byte[]]$rl[6..9]))
+                break
+            }
         }
     }
     if ($paired -eq 0) {
@@ -396,18 +405,29 @@ function Get-BoltSlotInfo {
     }
     $name = ''
     $reqName = [byte[]]@(0x10, 0xFF, 0x83, 0xB5, (0x60 + $Slot), 0x01, 0x00)
-    if ($Dev.Write($reqName)) {
-        $deadline = (Get-Date).AddMilliseconds(350)
+    if ($ioDev.Write($reqName)) {
+        $deadline = (Get-Date).AddMilliseconds(220)
         while ((Get-Date) -lt $deadline) {
-            $r = $Dev.Read(60)
-            if (-not $r -or $r.Length -lt 8) { continue }
-            if ($r[1] -eq 0xFF -and $r[2] -eq 0x8F -and $r[3] -eq 0x83 -and $r[4] -eq 0xB5) { break }
-            if ($r[1] -eq 0xFF -and $r[2] -eq 0x83 -and $r[3] -eq 0xB5 -and $r[4] -eq (0x60 + $Slot)) {
-                $nlen = [Math]::Min([int]$r[6], $r.Length - 7)
-                if ($nlen -gt 0) {
-                    $name = [Text.Encoding]::UTF8.GetString($r, 7, $nlen).TrimEnd([char]0)
+            if ($longDev) {
+                $rl = $longDev.Read(35)
+                if ($rl -and $rl.Length -ge 8 -and $rl[1] -eq 0xFF -and $rl[2] -eq 0x83 -and $rl[3] -eq 0xB5 -and $rl[4] -eq (0x60 + $Slot)) {
+                    $nlen = [Math]::Min([int]$rl[6], $rl.Length - 7)
+                    if ($nlen -gt 0) {
+                        $name = [Text.Encoding]::UTF8.GetString($rl, 7, $nlen).TrimEnd([char]0)
+                    }
+                    break
                 }
-                break
+            }
+            $r = $ioDev.Read(35)
+            if ($r -and $r.Length -ge 7) {
+                if ($r[1] -eq 0xFF -and $r[2] -eq 0x8F -and $r[3] -eq 0x83 -and $r[4] -eq 0xB5) { break }
+                if ($r.Length -ge 8 -and $r[1] -eq 0xFF -and $r[2] -eq 0x83 -and $r[3] -eq 0xB5 -and $r[4] -eq (0x60 + $Slot)) {
+                    $nlen = [Math]::Min([int]$r[6], $r.Length - 7)
+                    if ($nlen -gt 0) {
+                        $name = [Text.Encoding]::UTF8.GetString($r, 7, $nlen).TrimEnd([char]0)
+                    }
+                    break
+                }
             }
         }
     }
@@ -464,15 +484,29 @@ function Get-CachedDevices {
     }
 
     $valid = @()
+    $byPath = @{}
     foreach ($c in $entries) {
         $iface = New-Object 'Hid+Iface'
         $iface.Path = $c.Path; $iface.Product = $c.Product
         $iface.UsagePage = $c.UsagePage; $iface.Usage = $c.Usage; $iface.Pid = $c.Pid
         $iface.InLen = $c.InLen; $iface.OutLen = $c.OutLen
 
-        try { $dev = New-Object Hid $iface } catch {
-            foreach ($v in $valid) { $v.Dev.Close() }
-            return @()
+        if ($byPath.ContainsKey($c.Path)) {
+            $dev = $byPath[$c.Path]
+        } else {
+            try {
+                $dev = New-Object Hid $iface
+                $byPath[$c.Path] = $dev
+            } catch {
+                foreach ($v in $valid) { $v.Dev.Close() }
+                return @()
+            }
+        }
+
+        if ($c.DevIdx -ne 255 -and $c.FeatureIdx -ne 0) {
+            $valid += [pscustomobject]@{ Dev = $dev; ReportId = $c.ReportId; DevIdx = $c.DevIdx
+                                         FeatureIdx = $c.FeatureIdx; Iface = $iface }
+            continue
         }
 
         # Confirm the cached feature index still resolves to ChangeHost. Only
@@ -584,16 +618,31 @@ function Find-MxDevices {
     $contexts = @(); $opened = @(); $seen = @{}
     try {
         $ifaces = @(Get-MxInterfaces | Sort-Object { Get-DeviceRank $_.UsagePage $_.Usage $_.Product })
+        $shortDevs = @{}
+        if (-not $env:MXSWITCH_TEST) {
+            foreach ($sIface in $ifaces) {
+                if ($sIface.OutLen -eq 7) {
+                    try {
+                        $baseKey = $sIface.Path.ToLowerInvariant() -replace '&col[0-9a-f]{2}', ''
+                        $sDev = Open-MxDevice $sIface
+                        $opened += [pscustomobject]@{ Dev = $sDev }
+                        $shortDevs[$baseKey] = $sDev
+                    } catch { }
+                }
+            }
+        }
         foreach ($iface in $ifaces) {
             $preferred = $false
             try { $dev = Open-MxDevice $iface } catch { continue }
             $opened += [pscustomobject]@{ Dev = $dev }
+            $baseKey = $iface.Path.ToLowerInvariant() -replace '&col[0-9a-f]{2}', ''
+            $shortDev = if ($shortDevs.ContainsKey($baseKey)) { $shortDevs[$baseKey] } else { $null }
             $reportIds = @(0x11, 0x10) | Where-Object { $FRAME_LEN[[int]$_] -le $iface.OutLen } |
                 Sort-Object @{ Expression = { if ($FRAME_LEN[[int]$_] -eq $iface.OutLen) { 0 } else { 1 } } }
             foreach ($didx in $DEVICE_INDICES) {
                 if (-not $env:MXSWITCH_TEST -and $didx -eq 255 -and $iface.Product -match 'Receiver') { continue }
                 if (-not $env:MXSWITCH_TEST -and $didx -ne 255 -and $iface.OutLen -ne 20) { continue }
-                $slotInfo = Get-BoltSlotInfo $dev $didx
+                $slotInfo = Get-BoltSlotInfo $dev $didx $shortDev
                 if (-not $slotInfo.Paired) { continue }
                 $matched = $false
                 $idx = 0
@@ -631,6 +680,14 @@ function Find-MxDevices {
                         FeatureIdx = $idx; Iface = $deviceIface }
                     if (-not $All -and (Get-DeviceRank $deviceIface.UsagePage $deviceIface.Usage $deviceIface.Product) -lt 10) {
                         $preferred = $true; break
+                    }
+                } elseif ($seen.ContainsKey($metadata.Identity) -and (Test-MxName $metadata.Product $Names)) {
+                    # Replace duplicate slot with newer slot on the same receiver
+                    for ($k = 0; $k -lt $contexts.Count; $k++) {
+                        if ($contexts[$k].Iface.Product -eq $metadata.Product -and $contexts[$k].DevIdx -ne $didx) {
+                            $contexts[$k].DevIdx = $didx
+                            $contexts[$k].FeatureIdx = $idx
+                        }
                     }
                 }
                 if ($didx -eq 255) { break }
@@ -748,15 +805,23 @@ if ($modes.Count + [int]$PSBoundParameters.ContainsKey('Channel') -gt 1) {
 if ($List) {
     $found = [Hid]::Enumerate($VID)
     if (-not $found) { 'No Logitech vendor HID collections found.'; exit 1 }
+    $shortIfaces = @{}
+    foreach ($si in $found) {
+        if ($si.OutLen -eq 7) {
+            $shortIfaces[($si.Path.ToLowerInvariant() -replace '&col[0-9a-f]{2}', '')] = $si
+        }
+    }
     'usagePage:usage   pid    in  out  product'
     foreach ($iface in $found) {
         '   {0:x4}:{1:x4}     {2:x4}  {3,3} {4,4}  {5}' -f `
             $iface.UsagePage, $iface.Usage, $iface.Pid, $iface.InLen, $iface.OutLen, $iface.Product
         if ($iface.UsagePage -eq 0xFF00 -and $iface.InLen -ge 20) {
             try {
+                $baseKey = $iface.Path.ToLowerInvariant() -replace '&col[0-9a-f]{2}', ''
+                $sDev = if ($shortIfaces.ContainsKey($baseKey)) { Open-MxDevice $shortIfaces[$baseKey] } else { $null }
                 $dev = Open-MxDevice $iface
                 for ($slot = 1; $slot -le 6; $slot++) {
-                    $si = Get-BoltSlotInfo $dev $slot
+                    $si = Get-BoltSlotInfo $dev $slot $sDev
                     if ($si.Paired) {
                         '     slot {0}: {1} ({2})' -f $slot, $(if ($si.Name) { $si.Name } else { 'paired' }), $(if ($si.Identity) { $si.Identity } else { 'unknown serial' })
                     } else {
@@ -764,6 +829,7 @@ if ($List) {
                     }
                 }
                 $dev.Close()
+                if ($sDev) { $sDev.Close() }
             } catch {}
         }
     }
