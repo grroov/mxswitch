@@ -59,6 +59,10 @@ start "" /B wscript.exe //B //NoLogo "$VbsDest"
 
 Write-Host "[2/4] Installed mxswitch.ps1 and silent wrapper scripts to $InstallDir" -ForegroundColor Green
 
+# Clear any old cache files so fresh discovery runs on install
+Remove-Item -Path (Join-Path $ConfigDir 'tandem_cache.txt') -Force -ErrorAction SilentlyContinue
+Remove-Item -Path (Join-Path $ConfigDir 'device.json') -Force -ErrorAction SilentlyContinue
+
 # 3. If running as Administrator, add a Windows Defender exclusion for $InstallDir so Defender doesn't quarantine csc.exe output
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdmin) {
@@ -118,6 +122,12 @@ if ($csc -and (Test-Path $CsSource)) {
             $exeAvailable = $true
             $finalExePath = $ProgFilesExe
         }
+
+        # Pre-warm the device cache during install so the very first button click is instant!
+        try {
+            if ($exeAvailable) { & $finalExePath --cache | Out-Null }
+            & "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $Ps1Dest -Info -All | Out-Null
+        } catch { }
     }
 }
 

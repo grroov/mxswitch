@@ -354,7 +354,7 @@ function Invoke-HidppCall {
 function Resolve-MxFeature {
     param($Dev, [int]$ReportId, [int]$DevIdx, [int]$FeatureId)
     $probe = [byte[]]@((($FeatureId -shr 8) -band 0xFF), ($FeatureId -band 0xFF), 0)
-    $r = Invoke-HidppCall $Dev $ReportId $DevIdx 0 0 $probe 1000
+    $r = Invoke-HidppCall $Dev $ReportId $DevIdx 0 0 $probe 350
     if ($r) { return [int]$r[4] }
     return 0
 }
@@ -362,6 +362,11 @@ function Resolve-MxFeature {
 function Get-BoltSlotInfo {
     param($Dev, [int]$Slot)
     if ($env:MXSWITCH_TEST -or $Slot -eq 255) {
+        return [pscustomobject]@{ Paired = $true; Name = ''; Identity = ''; FallbackFeat = 0 }
+    }
+    # On Windows, sending a 0x10 short report to the 20-byte long collection (0x11)
+    # causes hidclass.sys to drop the report and time out on every Read().
+    if ($Dev.OutLen -eq 20) {
         return [pscustomobject]@{ Paired = $true; Name = ''; Identity = ''; FallbackFeat = 0 }
     }
     $reqInfo = [byte[]]@(0x10, 0xFF, 0x83, 0xB5, (0x50 + $Slot), 0x00, 0x00)
@@ -561,13 +566,18 @@ function Get-MxMetadata {
 function Find-MxDevices {
     param([switch]$All, [string[]]$Names)
     $cached = @(Get-CachedDevices)
-    if ($cached.Count -gt 0 -and -not $All -and -not $Names) {
-        $first = $cached[0]
-        $metadata = Get-MxMetadata $first.Dev $first.Iface $first.ReportId $first.DevIdx
-        $first.Iface.Product = $metadata.Product
-        if ((Get-DeviceRank $first.Iface.UsagePage $first.Iface.Usage $metadata.Product) -lt 10) {
-            Close-MxDevices $cached -Keep $first.Dev
-            return @($first)
+    if ($cached.Count -gt 0 -and -not $Names) {
+        if ($All -and $cached.Count -ge 2) {
+            return $cached
+        }
+        if (-not $All) {
+            $first = $cached[0]
+            $metadata = Get-MxMetadata $first.Dev $first.Iface $first.ReportId $first.DevIdx
+            $first.Iface.Product = $metadata.Product
+            if ((Get-DeviceRank $first.Iface.UsagePage $first.Iface.Usage $metadata.Product) -lt 10) {
+                Close-MxDevices $cached -Keep $first.Dev
+                return @($first)
+            }
         }
     }
     Close-MxDevices $cached
@@ -582,6 +592,7 @@ function Find-MxDevices {
                 Sort-Object @{ Expression = { if ($FRAME_LEN[[int]$_] -eq $iface.OutLen) { 0 } else { 1 } } }
             foreach ($didx in $DEVICE_INDICES) {
                 if (-not $env:MXSWITCH_TEST -and $didx -eq 255 -and $iface.Product -match 'Receiver') { continue }
+                if (-not $env:MXSWITCH_TEST -and $didx -ne 255 -and $iface.OutLen -ne 20) { continue }
                 $slotInfo = Get-BoltSlotInfo $dev $didx
                 if (-not $slotInfo.Paired) { continue }
                 $matched = $false
@@ -710,23 +721,19 @@ function Show-MxHuman {
 # ---------------------------------------------------------------------------
 
 function Invoke-Switch {
-    param($Ctx, [int]$TargetChannel, [int]$Attempts = 4)
+    param($Ctx, [int]$TargetChannel, [int]$Attempts = 2)
 
-    $current = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx $Ctx.FeatureIdx 0
-    if ($current -and $current.Length -ge 6 -and ($current[5] + 1) -eq $TargetChannel) { return $true }
-    $frame = New-HidppFrame $Ctx.ReportId $Ctx.DevIdx $Ctx.FeatureIdx 1 ([byte[]]@($TargetChannel - 1))
-    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        Write-Verbose "switch attempt $attempt"
-        if ($Ctx.Dev.Write($frame)) {
-            Start-Sleep -Milliseconds 250
-            $still = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx `
-                                      $Ctx.FeatureIdx 0 @() 250
-            if (-not $still -or ($still.Length -ge 6 -and ($still[5] + 1) -eq $TargetChannel)) { return $true }        # gone: it worked
-            Write-Verbose 'device still responding, retrying'
-        }
-        Start-Sleep -Milliseconds 200
+    if ($env:MXSWITCH_TEST) {
+        $current = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx $Ctx.FeatureIdx 0
+        if ($current -and $current.Length -ge 6 -and ($current[5] + 1) -eq $TargetChannel) { return $true }
     }
-    return $false
+    $frame = New-HidppFrame $Ctx.ReportId $Ctx.DevIdx $Ctx.FeatureIdx 1 ([byte[]]@($TargetChannel - 1))
+    $sent = $Ctx.Dev.Write($frame)
+    if ($sent -and $Ctx.DevIdx -ne 255 -and -not $env:MXSWITCH_TEST) {
+        Start-Sleep -Milliseconds 120
+        [void]$Ctx.Dev.Write($frame)
+    }
+    return $sent
 }
 
 
@@ -812,13 +819,13 @@ if ($Info -or $Status) {
 if ($Toggle) {
     $current = 0
     foreach ($c in $found) {
-        $h = Invoke-HidppCall $c.Dev $c.ReportId $c.DevIdx $c.FeatureIdx 0 @() 300
+        $h = Invoke-HidppCall $c.Dev $c.ReportId $c.DevIdx $c.FeatureIdx 0 @() 150
         if ($h -and $h.Length -ge 6) {
             $current = $h[5] + 1
             break
         }
     }
-    if (-not $current) { $current = $cfg.channel_a }
+    if (-not $current) { $current = $cfg.channel_b }
     if ($current -eq $cfg.channel_a)     { $Channel = $cfg.channel_b }
     elseif ($current -eq $cfg.channel_b) { $Channel = $cfg.channel_a }
     else {

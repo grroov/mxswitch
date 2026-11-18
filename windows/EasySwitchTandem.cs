@@ -52,6 +52,7 @@ namespace EasySwitch {
         [DllImport("hid.dll")] static extern bool HidD_FreePreparsedData(IntPtr pp);
         [DllImport("hid.dll")] static extern int  HidP_GetCaps(IntPtr pp, ref HIDP_CAPS c);
         [DllImport("hid.dll", CharSet=CharSet.Unicode)] static extern bool HidD_GetProductString(SafeFileHandle h, char[] buf, int len);
+        [DllImport("hid.dll")] static extern bool HidD_SetOutputReport(SafeFileHandle h, byte[] buf, int len);
 
         [DllImport("setupapi.dll", CharSet=CharSet.Unicode)]
         static extern IntPtr SetupDiGetClassDevsW(ref GUID g, IntPtr e, IntPtr w, int f);
@@ -133,14 +134,18 @@ namespace EasySwitch {
         }
 
         public bool Write(byte[] frame) {
-            if (outLen <= 0) return false;
+            if (outLen <= 0 || frame == null || frame.Length == 0) return false;
             var buf = new byte[outLen];
             Array.Copy(frame, buf, Math.Min(frame.Length, outLen));
             try {
                 stream.Write(buf, 0, outLen);
                 stream.Flush();
                 return true;
-            } catch { return false; }
+            } catch {
+                try {
+                    return HidD_SetOutputReport(handle, frame, frame.Length);
+                } catch { return false; }
+            }
         }
 
         public byte[] Read(int timeoutMs) {
@@ -169,6 +174,9 @@ namespace EasySwitch {
 
         class TargetDevice {
             public Hid Dev;
+            public string IfacePath;
+            public ushort InLen;
+            public ushort OutLen;
             public byte ReportId;
             public byte DevIdx;
             public byte FeatureIdx;
@@ -217,12 +225,16 @@ namespace EasySwitch {
 
         static bool ProbeBoltSlot(Hid dev, byte slot, out string name, out string identity, out byte fallbackFeat) {
             name = ""; identity = ""; fallbackFeat = 0;
-            byte[] reqInfo = new byte[] { 0x10, 0xFF, 0x83, 0xB5, (byte)(0x50 + slot), 0x00, 0x00 };
-            if (!dev.Write(reqInfo)) return true;
-            DateTime dl = DateTime.UtcNow.AddMilliseconds(300);
+            byte[] reqInfo = new byte[20];
+            reqInfo[0] = 0x11; reqInfo[1] = 0xFF; reqInfo[2] = 0x83; reqInfo[3] = 0xB5; reqInfo[4] = (byte)(0x50 + slot);
+            if (!dev.Write(reqInfo)) {
+                byte[] reqShort = new byte[] { 0x10, 0xFF, 0x83, 0xB5, (byte)(0x50 + slot), 0x00, 0x00 };
+                if (!dev.Write(reqShort)) return true;
+            }
+            DateTime dl = DateTime.UtcNow.AddMilliseconds(150);
             int paired = -1;
             while (DateTime.UtcNow < dl) {
-                byte[] r = dev.Read(60);
+                byte[] r = dev.Read(40);
                 if (r == null || r.Length < 7) continue;
                 if (r[1] == 0xFF && r[2] == 0x8F && r[3] == 0x83 && r[4] == 0xB5) {
                     paired = (r[5] == 0x08 || r[5] == 0x09) ? 0 : 1;
@@ -235,13 +247,14 @@ namespace EasySwitch {
                     break;
                 }
             }
-            if (paired == 0) return false;
+            if (paired <= 0) return false;
 
-            byte[] reqName = new byte[] { 0x10, 0xFF, 0x83, 0xB5, (byte)(0x60 + slot), 0x01, 0x00 };
-            if (dev.Write(reqName)) {
-                dl = DateTime.UtcNow.AddMilliseconds(300);
+            byte[] reqName = new byte[20];
+            reqName[0] = 0x11; reqName[1] = 0xFF; reqName[2] = 0x83; reqName[3] = 0xB5; reqName[4] = (byte)(0x60 + slot); reqName[5] = 0x01;
+            if (dev.Write(reqName) || dev.Write(new byte[] { 0x10, 0xFF, 0x83, 0xB5, (byte)(0x60 + slot), 0x01, 0x00 })) {
+                dl = DateTime.UtcNow.AddMilliseconds(150);
                 while (DateTime.UtcNow < dl) {
-                    byte[] r = dev.Read(60);
+                    byte[] r = dev.Read(40);
                     if (r == null || r.Length < 8) continue;
                     if (r[1] == 0xFF && r[2] == 0x8F && r[3] == 0x83 && r[4] == 0xB5) break;
                     if (r[1] == 0xFF && r[2] == 0x83 && r[3] == 0xB5 && r[4] == (byte)(0x60 + slot)) {
@@ -254,6 +267,69 @@ namespace EasySwitch {
             string upper = name.ToUpperInvariant();
             if (upper.Contains("M750") || upper.Contains("MX KEYS")) fallbackFeat = 0x0A;
             return true;
+        }
+
+        static string CacheFilePath() {
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"mxswitch\tandem_cache.txt");
+        }
+
+        static List<TargetDevice> LoadCachedTargets(List<Hid> opened) {
+            var list = new List<TargetDevice>();
+            string path = CacheFilePath();
+            if (!File.Exists(path)) return list;
+            try {
+                var byPath = new Dictionary<string, Hid>(StringComparer.OrdinalIgnoreCase);
+                foreach (string line in File.ReadAllLines(path)) {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    string[] p = line.Split('|');
+                    if (p.Length < 6) continue;
+                    string devPath = p[0];
+                    ushort inLen = ushort.Parse(p[1]);
+                    ushort outLen = ushort.Parse(p[2]);
+                    byte devIdx = byte.Parse(p[3]);
+                    byte featIdx = byte.Parse(p[4]);
+                    string name = p[5];
+
+                    Hid dev;
+                    if (!byPath.TryGetValue(devPath, out dev)) {
+                        var iface = new Hid.Iface { Path = devPath, InLen = inLen, OutLen = outLen, Product = name, UsagePage = 0xFF00 };
+                        dev = new Hid(iface);
+                        byPath[devPath] = dev;
+                        opened.Add(dev);
+                    }
+                    list.Add(new TargetDevice {
+                        Dev = dev, IfacePath = devPath, InLen = inLen, OutLen = outLen,
+                        ReportId = 0x11, DevIdx = devIdx, FeatureIdx = featIdx,
+                        Name = name, Identity = devPath + ":" + devIdx, Rank = DeviceRank(name)
+                    });
+                }
+            } catch {
+                list.Clear();
+            }
+            return list;
+        }
+
+        static void SaveCachedTargets(List<TargetDevice> targets) {
+            try {
+                string path = CacheFilePath();
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                var lines = new List<string>();
+                foreach (var t in targets) {
+                    lines.Add(string.Format("{0}|{1}|{2}|{3}|{4}|{5}", t.IfacePath, t.InLen, t.OutLen, t.DevIdx, t.FeatureIdx, t.Name));
+                }
+                File.WriteAllLines(path, lines.ToArray());
+            } catch { }
+        }
+
+        static void SwitchDeviceVerified(TargetDevice t, byte hostByte) {
+            for (int attempt = 0; attempt < 5; attempt++) {
+                HidppCall(t.Dev, t.ReportId, t.DevIdx, t.FeatureIdx, 1, new byte[] { hostByte }, 0);
+                Thread.Sleep(150);
+                // Verify by absence or by updated channel: if the device still replies on the old channel, resend!
+                byte[] still = HidppCall(t.Dev, t.ReportId, t.DevIdx, t.FeatureIdx, 0, null, 160);
+                if (still == null || (still.Length >= 6 && still[5] == hostByte))
+                    break;
+            }
         }
 
         static void LoadConfig(out int channelA, out int channelB) {
@@ -279,61 +355,65 @@ namespace EasySwitch {
             int channelA, channelB;
             LoadConfig(out channelA, out channelB);
 
+            bool dryRun = false;
             int explicitChannel = 0;
-            if (args.Length > 0 && int.TryParse(args[0], out explicitChannel) && (explicitChannel < 1 || explicitChannel > 3))
-                explicitChannel = 0;
+            foreach (string a in args) {
+                if (a.Equals("--dry-run", StringComparison.OrdinalIgnoreCase) || a.Equals("--cache", StringComparison.OrdinalIgnoreCase))
+                    dryRun = true;
+                else if (int.TryParse(a, out explicitChannel) && (explicitChannel < 1 || explicitChannel > 3))
+                    explicitChannel = 0;
+            }
 
-            var ifaces = Hid.Enumerate(LOGITECH_VID);
             var opened = new List<Hid>();
-            var targets = new List<TargetDevice>();
-
             try {
-                foreach (var iface in ifaces) {
-                    if (iface.OutLen < 20) continue; // Bolt HID++ long collection has OutLen == 20
-                    Hid dev;
-                    try { dev = new Hid(iface); } catch { continue; }
-                    opened.Add(dev);
+                var targets = LoadCachedTargets(opened);
+                if (targets.Count == 0) {
+                    var ifaces = Hid.Enumerate(LOGITECH_VID);
+                    foreach (var iface in ifaces) {
+                        if (iface.OutLen != 20) continue; // Only probe the 20-byte HID++ 2.0 long report collection (0x11)
+                        Hid dev;
+                        try { dev = new Hid(iface); } catch { continue; }
+                        opened.Add(dev);
 
-                    byte[] indices = new byte[] { 1, 2, 3, 4, 5, 6, 0xFF };
-                    foreach (byte didx in indices) {
-                        if (didx == 0xFF && (iface.Product ?? "").IndexOf("Receiver", StringComparison.OrdinalIgnoreCase) >= 0)
-                            continue;
-                        string sName = "", sId = "";
-                        byte fbFeat = 0;
-                        if (didx != 0xFF) {
-                            if (!ProbeBoltSlot(dev, didx, out sName, out sId, out fbFeat)) continue;
+                        byte[] indices = new byte[] { 1, 2, 3, 4, 5, 6, 0xFF };
+                        foreach (byte didx in indices) {
+                            if (didx == 0xFF && (iface.Product ?? "").IndexOf("Receiver", StringComparison.OrdinalIgnoreCase) >= 0)
+                                continue;
+                            byte[] r = HidppCall(dev, 0x11, didx, 0x00, 0, new byte[] { 0x18, 0x14, 0x00 }, 220);
+                            if (r == null || r[4] == 0) continue;
+                            byte featIdx = r[4];
+
+                            string devName = !string.IsNullOrEmpty(iface.Product) ? iface.Product : ("Slot " + didx);
+                            string devId = iface.Path.ToLowerInvariant() + ":" + didx;
+
+                            var td = new TargetDevice {
+                                Dev = dev, IfacePath = iface.Path, InLen = iface.InLen, OutLen = iface.OutLen,
+                                ReportId = 0x11, DevIdx = didx, FeatureIdx = featIdx,
+                                Name = devName, Identity = devId, Rank = (didx == 1 ? 20 : 0)
+                            };
+
+                            int existing = targets.FindIndex(t => t.Identity == devId);
+                            if (existing >= 0) targets[existing] = td;
+                            else targets.Add(td);
+
+                            if (didx == 0xFF) break;
                         }
-                        byte featIdx = fbFeat;
-                        if (featIdx == 0) {
-                            byte[] r = HidppCall(dev, 0x11, didx, 0x00, 0, new byte[] { 0x18, 0x14, 0x00 }, 800);
-                            if (r != null) featIdx = r[4];
-                        }
-                        if (featIdx == 0) continue;
-
-                        string devName = !string.IsNullOrEmpty(sName) ? sName : (!string.IsNullOrEmpty(iface.Product) ? iface.Product : ("Slot " + didx));
-                        string devId = !string.IsNullOrEmpty(sId) ? sId : (iface.Path + ":" + didx);
-
-                        var td = new TargetDevice {
-                            Dev = dev, ReportId = 0x11, DevIdx = didx, FeatureIdx = featIdx,
-                            Name = devName, Identity = devId, Rank = DeviceRank(devName)
-                        };
-
-                        int existing = targets.FindIndex(t => t.Identity == devId);
-                        if (existing >= 0) targets[existing] = td;
-                        else targets.Add(td);
-
-                        if (didx == 0xFF) break;
+                    }
+                    if (targets.Count > 0) {
+                        targets.Sort((a, b) => a.Rank.CompareTo(b.Rank));
+                        SaveCachedTargets(targets);
                     }
                 }
 
                 if (targets.Count == 0) return 1;
                 targets.Sort((a, b) => a.Rank.CompareTo(b.Rank));
+                if (dryRun) return 0;
 
                 int targetChannel = explicitChannel;
                 if (targetChannel == 0) {
                     int current = 0;
                     foreach (var t in targets) {
-                        byte[] r = HidppCall(t.Dev, t.ReportId, t.DevIdx, t.FeatureIdx, 0, null, 250);
+                        byte[] r = HidppCall(t.Dev, t.ReportId, t.DevIdx, t.FeatureIdx, 0, null, 120);
                         if (r != null && r.Length >= 6) {
                             current = r[5] + 1;
                             break;
@@ -344,12 +424,13 @@ namespace EasySwitch {
                 }
 
                 byte hostByte = (byte)(targetChannel - 1);
+                // Fire setCurrentHost to all targets immediately in parallel
                 foreach (var t in targets) {
                     HidppCall(t.Dev, t.ReportId, t.DevIdx, t.FeatureIdx, 1, new byte[] { hostByte }, 0);
-                    if (t.DevIdx != 0xFF) {
-                        Thread.Sleep(180);
-                        HidppCall(t.Dev, t.ReportId, t.DevIdx, t.FeatureIdx, 1, new byte[] { hostByte }, 0);
-                    }
+                }
+                Thread.Sleep(120);
+                foreach (var t in targets) {
+                    HidppCall(t.Dev, t.ReportId, t.DevIdx, t.FeatureIdx, 1, new byte[] { hostByte }, 0);
                 }
                 return 0;
             } finally {
