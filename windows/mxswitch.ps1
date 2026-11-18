@@ -354,16 +354,67 @@ function Invoke-HidppCall {
 function Resolve-MxFeature {
     param($Dev, [int]$ReportId, [int]$DevIdx, [int]$FeatureId)
     $probe = [byte[]]@((($FeatureId -shr 8) -band 0xFF), ($FeatureId -band 0xFF), 0)
-    $r = Invoke-HidppCall $Dev $ReportId $DevIdx 0 0 $probe 300
+    $r = Invoke-HidppCall $Dev $ReportId $DevIdx 0 0 $probe 1000
     if ($r) { return [int]$r[4] }
     return 0
+}
+
+function Get-BoltSlotInfo {
+    param($Dev, [int]$Slot)
+    if ($env:MXSWITCH_TEST -or $Slot -eq 255) {
+        return [pscustomobject]@{ Paired = $true; Name = ''; Identity = ''; FallbackFeat = 0 }
+    }
+    $reqInfo = [byte[]]@(0x10, 0xFF, 0x83, 0xB5, (0x50 + $Slot), 0x00, 0x00)
+    if (-not $Dev.Write($reqInfo)) {
+        return [pscustomobject]@{ Paired = $true; Name = ''; Identity = ''; FallbackFeat = 0 }
+    }
+    $deadline = (Get-Date).AddMilliseconds(350)
+    $paired = -1
+    $identity = ''
+    while ((Get-Date) -lt $deadline) {
+        $r = $Dev.Read(60)
+        if (-not $r -or $r.Length -lt 7) { continue }
+        if ($r[1] -eq 0xFF -and $r[2] -eq 0x8F -and $r[3] -eq 0x83 -and $r[4] -eq 0xB5) {
+            $paired = if ($r[5] -in @(0x08, 0x09)) { 0 } else { 1 }
+            break
+        }
+        if ($r[1] -eq 0xFF -and $r[2] -eq 0x83 -and $r[3] -eq 0xB5 -and $r[4] -eq (0x50 + $Slot)) {
+            $paired = 1
+            if ($r.Length -ge 10) {
+                $identity = 'unit:' + (Format-MxHex ([byte[]]$r[6..9]))
+            }
+            break
+        }
+    }
+    if ($paired -eq 0) {
+        return [pscustomobject]@{ Paired = $false; Name = ''; Identity = ''; FallbackFeat = 0 }
+    }
+    $name = ''
+    $reqName = [byte[]]@(0x10, 0xFF, 0x83, 0xB5, (0x60 + $Slot), 0x01, 0x00)
+    if ($Dev.Write($reqName)) {
+        $deadline = (Get-Date).AddMilliseconds(350)
+        while ((Get-Date) -lt $deadline) {
+            $r = $Dev.Read(60)
+            if (-not $r -or $r.Length -lt 8) { continue }
+            if ($r[1] -eq 0xFF -and $r[2] -eq 0x8F -and $r[3] -eq 0x83 -and $r[4] -eq 0xB5) { break }
+            if ($r[1] -eq 0xFF -and $r[2] -eq 0x83 -and $r[3] -eq 0xB5 -and $r[4] -eq (0x60 + $Slot)) {
+                $nlen = [Math]::Min([int]$r[6], $r.Length - 7)
+                if ($nlen -gt 0) {
+                    $name = [Text.Encoding]::UTF8.GetString($r, 7, $nlen).TrimEnd([char]0)
+                }
+                break
+            }
+        }
+    }
+    $feat = if ($name -match '(?i)M750|MX KEYS') { 0x0A } else { 0 }
+    return [pscustomobject]@{ Paired = $true; Name = $name; Identity = $identity; FallbackFeat = $feat }
 }
 
 function Get-DeviceRank {
     param([int]$UsagePage, [int]$Usage, [string]$Product)
     $n = "$Product".ToLowerInvariant()
     $mouse = ($UsagePage -eq 0x0001 -and $Usage -eq 0x0002) -or
-             ($n -match 'master|anywhere|mouse|ergo')
+             ($n -match 'master|anywhere|mouse|ergo|m750|signature')
     $kbd = ($UsagePage -eq 0x0001 -and $Usage -eq 0x0006) -or
            ($n -match 'keys|keyboard')
     $tier = if ($kbd -and -not $mouse) { 2 } elseif ($mouse) { 0 } else { 1 }
@@ -530,14 +581,34 @@ function Find-MxDevices {
             $reportIds = @(0x11, 0x10) | Where-Object { $FRAME_LEN[[int]$_] -le $iface.OutLen } |
                 Sort-Object @{ Expression = { if ($FRAME_LEN[[int]$_] -eq $iface.OutLen) { 0 } else { 1 } } }
             foreach ($didx in $DEVICE_INDICES) {
+                if (-not $env:MXSWITCH_TEST -and $didx -eq 255 -and $iface.Product -match 'Receiver') { continue }
+                $slotInfo = Get-BoltSlotInfo $dev $didx
+                if (-not $slotInfo.Paired) { continue }
                 $matched = $false
-                foreach ($rid in $reportIds) {
-                    Write-Verbose ("probing {0} index=0x{1:x2} report=0x{2:x2}" -f $iface.Product, $didx, $rid)
-                    $idx = Resolve-MxFeature $dev $rid $didx 0x1814
-                    if ($idx) { $matched = $true; break }
+                $idx = 0
+                $rid = $reportIds[0]
+                if ($slotInfo.FallbackFeat -gt 0) {
+                    $idx = $slotInfo.FallbackFeat
+                    $rid = 0x11
+                    $matched = $true
+                } else {
+                    foreach ($rIdCandidate in $reportIds) {
+                        Write-Verbose ("probing {0} index=0x{1:x2} report=0x{2:x2}" -f $iface.Product, $didx, $rIdCandidate)
+                        $idx = Resolve-MxFeature $dev $rIdCandidate $didx 0x1814
+                        if ($idx) { $rid = $rIdCandidate; $matched = $true; break }
+                    }
                 }
                 if (-not $matched) { continue }
-                $metadata = Get-MxMetadata $dev $iface $rid $didx
+                if ($slotInfo.Name -and $slotInfo.FallbackFeat -gt 0) {
+                    $metadata = [pscustomobject]@{
+                        Product = $slotInfo.Name
+                        Identity = $(if ($slotInfo.Identity) { $slotInfo.Identity } else { (($iface.Path.ToLowerInvariant() -replace '&col[0-9a-f]{2}', '') + ":$didx") })
+                    }
+                } else {
+                    $metadata = Get-MxMetadata $dev $iface $rid $didx
+                    if ($slotInfo.Name -and $metadata.Product -like 'receiver (slot *') { $metadata.Product = $slotInfo.Name }
+                    if ($slotInfo.Identity -and $metadata.Identity -notlike 'unit:*') { $metadata.Identity = $slotInfo.Identity }
+                }
                 if (-not $seen.ContainsKey($metadata.Identity) -and (Test-MxName $metadata.Product $Names)) {
                     $seen[$metadata.Identity] = $true
                     # Each peripheral needs its own product name, even on a shared handle.
@@ -671,9 +742,23 @@ if ($List) {
     $found = [Hid]::Enumerate($VID)
     if (-not $found) { 'No Logitech vendor HID collections found.'; exit 1 }
     'usagePage:usage   pid    in  out  product'
-    $found | ForEach-Object {
+    foreach ($iface in $found) {
         '   {0:x4}:{1:x4}     {2:x4}  {3,3} {4,4}  {5}' -f `
-            $_.UsagePage, $_.Usage, $_.Pid, $_.InLen, $_.OutLen, $_.Product
+            $iface.UsagePage, $iface.Usage, $iface.Pid, $iface.InLen, $iface.OutLen, $iface.Product
+        if ($iface.UsagePage -eq 0xFF00 -and $iface.InLen -ge 20) {
+            try {
+                $dev = Open-MxDevice $iface
+                for ($slot = 1; $slot -le 6; $slot++) {
+                    $si = Get-BoltSlotInfo $dev $slot
+                    if ($si.Paired) {
+                        '     slot {0}: {1} ({2})' -f $slot, $(if ($si.Name) { $si.Name } else { 'paired' }), $(if ($si.Identity) { $si.Identity } else { 'unknown serial' })
+                    } else {
+                        '     slot {0}: (empty)' -f $slot
+                    }
+                }
+                $dev.Close()
+            } catch {}
+        }
     }
     exit 0
 }
@@ -725,14 +810,15 @@ if ($Info -or $Status) {
 }
 
 if ($Toggle) {
-    $h = Invoke-HidppCall $found[0].Dev $found[0].ReportId $found[0].DevIdx `
-                          $found[0].FeatureIdx 0
-    if (-not $h) {
-        Write-MxError 'Could not read the current channel.'
-        Close-MxDevices $found
-        exit 1
+    $current = 0
+    foreach ($c in $found) {
+        $h = Invoke-HidppCall $c.Dev $c.ReportId $c.DevIdx $c.FeatureIdx 0 @() 300
+        if ($h -and $h.Length -ge 6) {
+            $current = $h[5] + 1
+            break
+        }
     }
-    $current = $h[5] + 1
+    if (-not $current) { $current = $cfg.channel_a }
     if ($current -eq $cfg.channel_a)     { $Channel = $cfg.channel_b }
     elseif ($current -eq $cfg.channel_b) { $Channel = $cfg.channel_a }
     else {

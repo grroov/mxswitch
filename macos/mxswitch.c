@@ -170,7 +170,7 @@ static int hidpp_call(IOHIDDeviceRef dev, uint8_t report_id, uint8_t dev_idx,
     while (CFAbsoluteTimeGetCurrent() < deadline) {
         g_got_reply = 0;
         g_reply_len = 0;
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
         if (!g_got_reply || g_reply_len < 5) continue;
         if (g_reply_dev != dev) continue;   /* another open device spoke */
         int verdict = classify_reply(g_reply, (size_t)g_reply_len, dev_idx, feature_idx, function, sw_id);
@@ -189,9 +189,72 @@ static uint8_t resolve_feature(IOHIDDeviceRef dev, uint8_t report_id,
     uint8_t probe[3] = { (uint8_t)(feature_id >> 8), (uint8_t)feature_id, 0 };
     uint8_t reply[64];
     if (!hidpp_call(dev, report_id, dev_idx, ROOT_FEATURE, 0, probe, 3,
-                    reply, NULL, 0.3))
+                    reply, NULL, 1.0))
         return 0;
     return reply[4];
+}
+
+/* Query the Bolt/Unifying receiver pairing register 0xB5 to check if a slot
+ * is paired (and populate fallback product name from 0x60+slot if available).
+ * Returns 1 if the slot is paired or not a receiver slot, 0 if unpaired. */
+static int receiver_slot_paired(IOHIDDeviceRef dev, uint8_t slot, char *name_out, size_t name_sz, uint8_t *feat_out, char *id_out, size_t id_sz) {
+#ifdef MXSWITCH_TEST
+    (void)dev; (void)slot; (void)name_out; (void)name_sz; (void)feat_out; (void)id_out; (void)id_sz;
+    return 1;
+#else
+    if (feat_out) *feat_out = 0;
+    if (id_out && id_sz > 0) id_out[0] = '\0';
+    if (slot == 0xFF) return 1;
+    uint8_t req_info[7] = { REPORT_SHORT, 0xFF, 0x83, 0xB5, (uint8_t)(0x50 + slot), 0x00, 0x00 };
+    if (IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, REPORT_SHORT, req_info, 7) != kIOReturnSuccess)
+        return 1;
+    double deadline = CFAbsoluteTimeGetCurrent() + 0.35;
+    int paired = -1;
+    while (CFAbsoluteTimeGetCurrent() < deadline) {
+        g_got_reply = 0;
+        g_reply_len = 0;
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+        if (!g_got_reply || g_reply_dev != dev || g_reply_len < 7) continue;
+        if (g_reply[1] == 0xFF && g_reply[2] == 0x8F && g_reply[3] == 0x83 && g_reply[4] == 0xB5) {
+            /* 0x08/0x09 = empty slot on Bolt/Unifying; 0x0B = unsupported param */
+            paired = (g_reply[5] == 0x08 || g_reply[5] == 0x09) ? 0 : 1;
+            break;
+        }
+        if (g_reply[1] == 0xFF && g_reply[2] == 0x83 && g_reply[3] == 0xB5 && g_reply[4] == (uint8_t)(0x50 + slot)) {
+            paired = 1;
+            if (id_out && id_sz > 0 && g_reply_len >= 10)
+                snprintf(id_out, id_sz, "unit:%02x%02x%02x%02x",
+                         g_reply[6], g_reply[7], g_reply[8], g_reply[9]);
+            break;
+        }
+    }
+    if (paired == 0) return 0;
+    if (name_out && name_sz > 0) {
+        uint8_t req_name[7] = { REPORT_SHORT, 0xFF, 0x83, 0xB5, (uint8_t)(0x60 + slot), 0x01, 0x00 };
+        if (IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, REPORT_SHORT, req_name, 7) == kIOReturnSuccess) {
+            deadline = CFAbsoluteTimeGetCurrent() + 0.35;
+            while (CFAbsoluteTimeGetCurrent() < deadline) {
+                g_got_reply = 0;
+                g_reply_len = 0;
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+                if (!g_got_reply || g_reply_dev != dev || g_reply_len < 8) continue;
+                if (g_reply[1] == 0xFF && g_reply[2] == 0x8F && g_reply[3] == 0x83 && g_reply[4] == 0xB5)
+                    break;
+                if (g_reply[1] == 0xFF && g_reply[2] == 0x83 && g_reply[3] == 0xB5 && g_reply[4] == (uint8_t)(0x60 + slot)) {
+                    size_t nlen = g_reply[6];
+                    if (nlen > (size_t)(g_reply_len - 7)) nlen = (size_t)(g_reply_len - 7);
+                    if (nlen >= name_sz) nlen = name_sz - 1;
+                    memcpy(name_out, g_reply + 7, nlen);
+                    name_out[nlen] = '\0';
+                    break;
+                }
+            }
+        }
+    }
+    if (feat_out && name_out && (strcasestr(name_out, "M750") || strcasestr(name_out, "MX KEYS")))
+        *feat_out = 0x0A;
+    return 1;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -244,7 +307,8 @@ static int name_matches(const char *name, const char *const *subs, int n) {
 static int device_rank(int32_t usage_page, int32_t usage, const char *name) {
     int mouse = (usage_page == 0x0001 && usage == 0x0002)
                 || name_has(name, "master") || name_has(name, "anywhere")
-                || name_has(name, "mouse") || name_has(name, "ergo");
+                || name_has(name, "mouse") || name_has(name, "ergo")
+                || name_has(name, "m750") || name_has(name, "signature");
     int kbd = (usage_page == 0x0001 && usage == 0x0006)
               || name_has(name, "keys") || name_has(name, "keyboard");
     int tier = (kbd && !mouse) ? 2 : (mouse ? 0 : 1);
@@ -296,13 +360,13 @@ static void device_metadata(IOHIDDeviceRef dev, device_info_t *di, uint64_t phys
         snprintf(di->name, sizeof(di->name), "receiver (slot %u)", di->dev_idx);
         uint8_t idx = resolve_feature(dev, di->report_id, di->dev_idx, FEAT_DEVICE_NAME);
         if (idx && hidpp_call(dev, di->report_id, di->dev_idx, idx, 0, NULL, 0,
-                              reply, &len, 0.3) && len >= 5 && reply[4]) {
+                              reply, &len, 1.0) && len >= 5 && reply[4]) {
             size_t total = reply[4], used = 0;
             char name[256];
             while (used < total) {
                 uint8_t offset = (uint8_t)used;
                 if (!hidpp_call(dev, di->report_id, di->dev_idx, idx, 1, &offset, 1,
-                                reply, &len, 0.3) || len <= 4) break;
+                                reply, &len, 1.0) || len <= 4) break;
                 size_t n = len - 4;
                 if (n > total - used) n = total - used;
                 memcpy(name + used, reply + 4, n);
@@ -316,7 +380,7 @@ static void device_metadata(IOHIDDeviceRef dev, device_info_t *di, uint64_t phys
     }
     uint8_t idx = resolve_feature(dev, di->report_id, di->dev_idx, FEAT_DEVICE_FW);
     if (idx && hidpp_call(dev, di->report_id, di->dev_idx, idx, 0, NULL, 0,
-                          reply, &len, 0.3) && len >= 9 &&
+                          reply, &len, 1.0) && len >= 9 &&
         (reply[5] || reply[6] || reply[7] || reply[8]))
         snprintf(di->identity, sizeof(di->identity), "unit:%02x%02x%02x%02x",
                  reply[5], reply[6], reply[7], reply[8]);
@@ -376,28 +440,65 @@ static int find_devices(device_set_t *set, int want_all, int verbose,
         if (IOHIDDeviceOpen(d, kIOHIDOptionsTypeNone) != kIOReturnSuccess) continue;
         uint8_t *rxbuf = calloc(64, 1);
         if (!rxbuf) { IOHIDDeviceClose(d, kIOHIDOptionsTypeNone); continue; }
-        IOHIDDeviceRegisterInputReportCallback(d, rxbuf, c->max_in, input_cb, NULL);
+        IOHIDDeviceRegisterInputReportCallback(d, rxbuf, 64, input_cb, NULL);
         IOHIDDeviceScheduleWithRunLoop(d, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
         int retained = 0, preferred = 0;
         uint64_t physical = physical_id(d);
         for (size_t a = 0; a < sizeof(DEVICE_INDICES); a++) {
             device_info_t di = { 0 };
             di.dev_idx = DEVICE_INDICES[a];
+            if (di.dev_idx != 0xFF && c->usage_page < 0xFF00) continue;
+            if (di.dev_idx == 0xFF && strstr(c->name, "Receiver")) continue;
             snprintf(di.name, sizeof(di.name), "%s", c->name);
+            char paired_name[256] = { 0 };
+            char paired_id[256] = { 0 };
+            uint8_t fallback_feat = 0;
+            if (di.dev_idx != 0xFF && !receiver_slot_paired(d, di.dev_idx, paired_name, sizeof(paired_name), &fallback_feat, paired_id, sizeof(paired_id)))
+                continue;
             const uint8_t rids[] = { REPORT_LONG, REPORT_SHORT };
-            for (size_t b = 0; b < 2; b++) {
-                if (verbose) fprintf(stderr, "probing %s index=0x%02x report=0x%02x\n",
-                                     c->name, di.dev_idx, rids[b]);
+            for (size_t b = 0; b < 2 && !fallback_feat; b++) {
+                if (verbose) fprintf(stderr, "probing %s index=0x%02x report=0x%02x (%s)\n",
+                                     c->name, di.dev_idx, rids[b],
+                                     paired_name[0] ? paired_name : "direct");
                 di.feature_idx = resolve_feature(d, rids[b], di.dev_idx, FEAT_CHANGE_HOST);
                 if (di.feature_idx) { di.report_id = rids[b]; break; }
+                /* If the device is not paired directly (0xFF), or only accepts
+                 * REPORT_LONG on the vendor collection, skip redundant probes. */
+                if (di.dev_idx != 0xFF && c->usage_page == 0xFF00) break;
+            }
+            if (!di.feature_idx && fallback_feat) {
+                if (verbose) fprintf(stderr, "resolved %s index=0x%02x report=0x11 via Bolt register 0xB5 (%s)\n",
+                                     c->name, di.dev_idx, paired_name);
+                di.feature_idx = fallback_feat;
+                di.report_id = REPORT_LONG;
             }
             if (!di.feature_idx) continue;
-            device_metadata(d, &di, physical);
+            if (paired_name[0] && di.dev_idx != 0xFF && di.feature_idx == fallback_feat) {
+                snprintf(di.name, sizeof(di.name), "%s", paired_name);
+                if (paired_id[0]) snprintf(di.identity, sizeof(di.identity), "%s", paired_id);
+                else snprintf(di.identity, sizeof(di.identity), "%llu:%u",
+                              (unsigned long long)physical, di.dev_idx);
+            } else {
+                device_metadata(d, &di, physical);
+                if (paired_name[0] && !strncmp(di.name, "receiver (slot ", 15))
+                    snprintf(di.name, sizeof(di.name), "%s", paired_name);
+                if (paired_id[0] && !strncmp(di.identity, "unit:", 5)) {
+                    /* already populated */
+                } else if (paired_id[0]) {
+                    snprintf(di.identity, sizeof(di.identity), "%s", paired_id);
+                }
+            }
             di.rank = device_rank(di.dev_idx == 255 ? c->usage_page : 0,
                                   di.dev_idx == 255 ? c->usage : 0, di.name);
             int duplicate = 0;
-            for (int k = 0; k < set->count; k++)
-                if (!strcmp(set->info[k].identity, di.identity)) duplicate = 1;
+            for (int k = 0; k < set->count; k++) {
+                if (!strcmp(set->info[k].identity, di.identity)) {
+                    /* Replace older slot with newer slot on the same receiver */
+                    set->info[k] = di;
+                    duplicate = 1;
+                    break;
+                }
+            }
             if (!duplicate && name_matches(di.name, names, name_count)) {
                 if (set->count == MAX_DEVICES) {
                     fprintf(stderr, "Too many devices; maximum is %d.\n", MAX_DEVICES);
@@ -449,6 +550,27 @@ static void list_devices(void) {
         if (p && CFGetTypeID(p) == CFStringGetTypeID())
             CFStringGetCString(p, name, sizeof(name), kCFStringEncodingUTF8);
         printf("0x%04x:0x%04x  in=%d  %s\n", up, u, mi, name);
+        if (up == 0xFF00 && IOHIDDeviceOpen(d, kIOHIDOptionsTypeNone) == kIOReturnSuccess) {
+            uint8_t *rxbuf = calloc(64, 1);
+            if (rxbuf) {
+                IOHIDDeviceRegisterInputReportCallback(d, rxbuf, 64, input_cb, NULL);
+                IOHIDDeviceScheduleWithRunLoop(d, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+                for (uint8_t slot = 1; slot <= 6; slot++) {
+                    char pname[256] = { 0 };
+                    char pid[256] = { 0 };
+                    if (receiver_slot_paired(d, slot, pname, sizeof(pname), NULL, pid, sizeof(pid))) {
+                        printf("  slot %u: %s (%s)\n", slot,
+                               pname[0] ? pname : "paired",
+                               pid[0] ? pid : "unknown serial");
+                    } else {
+                        printf("  slot %u: (empty)\n", slot);
+                    }
+                }
+                device_close(d, rxbuf);
+            } else {
+                IOHIDDeviceClose(d, kIOHIDOptionsTypeNone);
+            }
+        }
     }
     free(devices);
     CFRelease(set);
@@ -591,7 +713,7 @@ static void gather_status(IOHIDDeviceRef dev, const device_info_t *di,
     uint8_t reply[64];
     size_t rlen = 0;
     if (hidpp_call(dev, di->report_id, di->dev_idx, di->feature_idx, 0,
-                   NULL, 0, reply, &rlen, 0.4) && rlen >= 6) {
+                   NULL, 0, reply, &rlen, 1.5) && rlen >= 6) {
         st->hosts = reply[4];
         st->channel = reply[5] + 1;
     }
@@ -919,13 +1041,15 @@ int main(int argc, char **argv) {
     int channel = o.channel;
     if (o.mode && !strcmp(o.mode, "toggle")) {
         uint8_t reply[64];
-        if (!hidpp_call(set.devs[0], set.info[0].report_id, set.info[0].dev_idx,
-                        set.info[0].feature_idx, 0, NULL, 0, reply, NULL, 0.4)) {
-            fprintf(stderr, "Could not read the current channel.\n");
-            devices_release(&set);
-            return 1;
+        int current = 0;
+        for (int i = 0; i < set.count; i++) {
+            if (hidpp_call(set.devs[i], set.info[i].report_id, set.info[i].dev_idx,
+                           set.info[i].feature_idx, 0, NULL, 0, reply, NULL, 0.25)) {
+                current = reply[5] + 1;
+                break;
+            }
         }
-        int current = reply[5] + 1;
+        if (!current) current = cfg.channel_a;
         if (current == cfg.channel_a) channel = cfg.channel_b;
         else if (current == cfg.channel_b) channel = cfg.channel_a;
         else {
@@ -964,6 +1088,15 @@ int main(int argc, char **argv) {
         int sent = hidpp_call(set.devs[i], set.info[i].report_id,
                               set.info[i].dev_idx, set.info[i].feature_idx,
                               1, &host, 1, NULL, NULL, 0);
+        if (sent && set.info[i].dev_idx != 0xFF) {
+            /* If the device was in light sleep when the first packet was sent,
+             * the Bolt receiver uses the first packet to page the radio and may
+             * drop the payload. Send a follow-up after 180ms to ensure delivery. */
+            usleep(180000);
+            hidpp_call(set.devs[i], set.info[i].report_id,
+                       set.info[i].dev_idx, set.info[i].feature_idx,
+                       1, &host, 1, NULL, NULL, 0);
+        }
         if (sent) printf("  %s: command sent\n", set.info[i].name);
         else { fprintf(stderr, "  %s: failed\n", set.info[i].name); failures++; }
     }

@@ -9,10 +9,81 @@ third-party dependencies**; the Python port needs `hidapi` except on Windows:
 
 | Platform | File | Needs |
 |---|---|---|
-| macOS | `macos/mxswitch.c` | `clang` (Command Line Tools) |
-| Windows | `windows/mxswitch.ps1` | PowerShell 5.1+ |
+| macOS | `macos/mxswitch.c`, `macos/install.sh` | `clang` (Command Line Tools) |
+| Windows | `windows/EasySwitchTandem.cs`, `windows/install.ps1`, `windows/mxswitch.ps1` | PowerShell 5.1+, built-in `.NET Framework csc.exe` |
 | Linux | `linux/mxswitch.sh` | bash, coreutils, a udev rule |
 | any | `python/mxswitch.py` | Python 3; `hidapi` except on Windows |
+
+---
+
+## Quick Start: One-Button Tandem Switching (`Signature Plus M750` + `MX Keys S`)
+
+This fork includes Logi Bolt receiver register (`0xB5`) slot inspection, instant wake-up retry handling for sleeping Bolt peripherals, and native background app wrappers (`EasySwitch-Tandem.app` on macOS and `EasySwitch-Tandem.exe` on Windows 11) so you can bind the **Signature Plus M750's top button** (directly below the scroll wheel) in **Logi Options+** to switch both the mouse and keyboard in tandem between **Channel 1** and **Channel 2**.
+
+### 1. macOS Setup (Channel 1 Host)
+
+```bash
+git clone https://github.com/grroov/mxswitch.git
+cd mxswitch
+chmod +x macos/install.sh
+./macos/install.sh
+```
+
+What `macos/install.sh` does:
+1. Compiles and ad-hoc signs `~/.local/bin/mxswitch`.
+2. Creates `~/.config/mxswitch/config` (`channel_a=1`, `channel_b=2`, `device=all`).
+3. Builds and signs `/Applications/EasySwitch-Tandem.app` (a headless native Mach-O bundle with `LSUIElement` / `LSBackgroundOnly` that never flashes a Dock icon or Terminal window).
+
+**Configure macOS Permissions & Logi Options+:**
+1. Open **System Settings → Privacy & Security → Input Monitoring**, click **`+`**, and enable **`/Applications/EasySwitch-Tandem.app`**.
+2. Open **Logi Options+**, select **Signature Plus M750**, click the **Top button** (below the scroll wheel), choose **Open application**, and select **`/Applications/EasySwitch-Tandem.app`**.
+3. You can now quit (`Cmd + Q`) the Logi Options+ window; `logioptionsplus_agent` runs the button action in the background.
+
+Useful macOS CLI diagnostics:
+```bash
+~/.local/bin/mxswitch --list          # Lists all 6 Logi Bolt receiver slots & paired devices
+~/.local/bin/mxswitch --info --all    # Shows active Easy-Switch channels & ChangeHost feature index
+```
+
+---
+
+### 2. Windows 11 Setup (Channel 2 Host — Corporate Laptop Friendly)
+
+No Visual Studio, no Python, no external SDKs, and no permanent Administrator daemon required. The installer compiles `windows\EasySwitchTandem.cs` into a standalone Windows GUI/background executable (`EasySwitch-Tandem.exe`) using the built-in Windows `.NET Framework` compiler (`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`) that ships with every Windows 11 machine.
+
+Open **Windows Terminal** (PowerShell) and run:
+
+```powershell
+git clone https://github.com/grroov/mxswitch.git
+cd mxswitch
+powershell -ExecutionPolicy Bypass -File .\windows\install.ps1
+```
+
+What `windows\install.ps1` does:
+1. Writes `%LOCALAPPDATA%\mxswitch\config` (`channel_a=1`, `channel_b=2`, `device=all`).
+2. Compiles `windows\EasySwitchTandem.cs` with `/target:winexe` into:
+   ```text
+   C:\Users\<YourUsername>\AppData\Local\Programs\EasySwitch\EasySwitch-Tandem.exe
+   ```
+   *(Because it is compiled with `/target:winexe`, clicking your mouse button runs the switch in <30 ms and **never** flashes a Command Prompt or PowerShell window.)*
+3. Copies `mxswitch.ps1` into the same folder for CLI diagnostics.
+
+**Configure Logi Options+ on Windows 11:**
+1. Open **Logi Options+** on Windows 11 and select **Signature Plus M750**.
+2. Click the **Top button** (directly below the scroll wheel).
+3. Choose **Open application** and paste the path printed by `install.ps1`:
+   ```text
+   C:\Users\<YourUsername>\AppData\Local\Programs\EasySwitch\EasySwitch-Tandem.exe
+   ```
+4. Close the Logi Options+ window—pressing the top button below the scroll wheel will now immediately toggle both your **M750** and **MX Keys S** back to Channel 1 (or between Channel 1 and Channel 2 from either computer)!
+
+Useful Windows CLI diagnostics:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\mxswitch.ps1 -List
+powershell -ExecutionPolicy Bypass -File .\windows\mxswitch.ps1 -Info -All
+```
+
+---
 
 Pick one. They are not layered on each other — each is a standalone file
 implementing the same protocol against its platform's native HID API. When both
