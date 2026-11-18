@@ -1,8 +1,24 @@
-# mxswitch
+# mxswitch (Tandem Easy-Switch Fork)
 
-Switch a Logitech Easy-Switch device — MX Master 3S, MX Keys, MX Anywhere and
-friends — between paired computers with a keyboard shortcut, without reaching
-for the button on the underside and without running Logitech Options+.
+Switch your **Logitech Signature Plus M750** mouse and **Logitech MX Keys S** keyboard in tandem between paired computers with a single press of the button directly below the M750 scroll wheel.
+
+## Quick Reference Summary
+
+- **macOS (Channel 1):**
+  - **App bound in Logi Options+:** `/Applications/EasySwitch-Tandem.app`
+  - **Config:** `~/.config/mxswitch/config` (`channel_a=1`, `channel_b=2`, `device=all`)
+  - **One-step installer:** `./macos/install.sh`
+  - **Inspect Bolt receiver slots:** `~/.local/bin/mxswitch --list`
+  - **Inspect active channels:** `~/.local/bin/mxswitch --info --all`
+- **Windows 11 (Channel 2):**
+  - **App bound in Logi Options+:** `EasySwitch-Tandem.exe` (installed to `%LOCALAPPDATA%\Programs\EasySwitch\EasySwitch-Tandem.exe` and `C:\Program Files\EasySwitch\EasySwitch-Tandem.exe` when run as Admin, compiled via `windows\install.ps1` from `windows\EasySwitchTandem.cs`)
+  - **Silent script fallbacks (if corporate EDR blocks custom `.exe`):** `%LOCALAPPDATA%\Programs\EasySwitch\EasySwitch-Tandem.cmd` / `EasySwitch-Tandem.vbs`
+  - **Config & Cache:** `%LOCALAPPDATA%\mxswitch\config` and `%LOCALAPPDATA%\mxswitch\tandem_cache.txt`
+  - **One-step installer:** `powershell.exe -ExecutionPolicy Bypass -File .\windows\install.ps1`
+  - **Inspect Bolt receiver slots:** `powershell -ExecutionPolicy Bypass -File .\windows\mxswitch.ps1 -List`
+  - **Inspect active channels:** `powershell -ExecutionPolicy Bypass -File .\windows\mxswitch.ps1 -Info -All`
+
+---
 
 Four independent implementations, one per platform. The native ones need **no
 third-party dependencies**; the Python port needs `hidapi` except on Windows:
