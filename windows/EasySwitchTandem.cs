@@ -1,11 +1,21 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
+
+[assembly: AssemblyTitle("Logitech Easy-Switch Tandem Utility")]
+[assembly: AssemblyDescription("Logitech HID++ ChangeHost (0x1814) Easy-Switch Utility")]
+[assembly: AssemblyCompany("LogiSwitch Local Tooling")]
+[assembly: AssemblyProduct("EasySwitch-Tandem")]
+[assembly: AssemblyCopyright("MIT License")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: ComVisible(false)]
 
 namespace EasySwitch {
     public class Hid {
